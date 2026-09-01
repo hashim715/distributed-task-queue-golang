@@ -1,0 +1,26 @@
+# Binaries
+/distributed_task_queue_golang
+/main
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go build/test artifacts
+*.out
+
+# Go workspace / module cache files
+go.work
+go.work.sum
+
+# Environment / local config
+.env
+
+# OS files
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
