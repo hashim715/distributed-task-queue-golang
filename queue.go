@@ -5,91 +5,45 @@ import (
 	"time"
 )
 
+var maxRetries int = 5;
+
 type Queue struct {
-	jobs []Job
-	current int
+	jobs chan *Job
 };
 
 func NewQueue() *Queue {
-	return &Queue{jobs: []Job{}, current: 0};
+	return &Queue{jobs: make(chan *Job)};
 };
 
-func (queue *Queue) Add(job *Job) {
-	queue.jobs = append(queue.jobs, *job);
-};
-
-func (queue *Queue) Remove(id string) error {
-	index := -1;
-	for i := range queue.jobs {
-		if queue.jobs[i].ID == id {
-			index = i;
-			break;
-		};
-	};
-	if index == -1 {
-		return fmt.Errorf("Job not found baby");
-	};
-	queue.jobs = append(queue.jobs[:index], queue.jobs[index+1:]...);
-	fmt.Printf("removed the job with id: %s from jobs in the queue\n", id);
-	return nil;
+func (queue *Queue) Enqueue(job *Job) {
+	queue.jobs<-job;
 };
 
 func (queue *Queue) Dequeue() (*Job,bool) {
-	if queue.current > len(queue.jobs) {
-		return nil, false
+	job, ok := <-queue.jobs;
+	if !ok {
+		return nil, false;
 	};
-	job := queue.jobs[queue.current];
-	queue.current++;
-	return &job,true;
+	return job,true;
 };
 
-func (queue *Queue) Process(id string) error {
-	index := -1;
-	for i := range queue.jobs {
-		if queue.jobs[i].ID == id {
-			index = i;
-			break;
-		};
-	};
-	if index == -1 {
-		return fmt.Errorf("Job not found baby");
-	};
+func (queue *Queue) Process(job *Job) error {
 	fmt.Println("processing.....");
-	queue.jobs[index].Status = "running";
+	job.Status = "running";
 	time.Sleep(5 * time.Second);
 	fmt.Println("Proccess succeeded");
 	return nil;
 };
 
-func (queue *Queue) Ack(id string) error {
-	index := -1;
-	for i := range queue.jobs {
-		if queue.jobs[i].ID == id {
-			index = i;
-			break;
-		};
-	};
-	if index == -1 {
-		return fmt.Errorf("Job not found baby");
-	};
-	queue.jobs[index].Status = "completed";
-	queue.Remove(id);
-	fmt.Printf("Acknowledged the job with id: %s\n", id);
+func (queue *Queue) Ack(job *Job) error {
+	job.Status = "completed";
+	fmt.Printf("Acknowledged the job with id: %s\n", job.ID);
 	return  nil;
 };
 
-func (queue *Queue) Nack(id string) error {
-	index := -1;
-	for i := range queue.jobs {
-		if queue.jobs[i].ID == id {
-			index = i;
-			break;
-		};
-	};
-	if index == -1 {
-		return fmt.Errorf("Job not found baby");
-	};
-	queue.jobs[index].Status = "failed";
-	fmt.Printf("Not Acknowledged the job with id: %s\n", id);
+func (queue *Queue) Nack(job *Job) error {
+	job.Status = "failed";
+	job.Attempts++;
+	fmt.Printf("Not Acknowledged the job with id: %s\n", job.ID);
 	return  nil;
 };

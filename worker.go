@@ -11,12 +11,12 @@ func worker(queue *Queue, wg *sync.WaitGroup) {
 			return; // no more jobs
 		};
 
-		err := queue.Process(job.ID);
+		err := queue.Process(job);
 
 		if err != nil {
-			queue.Nack(job.ID);
+			queue.Nack(job);
 		} else {
-			queue.Ack(job.ID)
+			queue.Ack(job)
 		};
 	};
 };
