@@ -1,17 +1,21 @@
 package main
 
-import "fmt"
+import (
+	"sync"
+);
 
 func main() {
 	queue := NewQueue();
-	job := NewJob("NewId", "Hey body..", "nil" , "today");
+	job := NewJob("Id1", "Hey body..", "nil" , "today");
 	queue.Add(job);
-	fmt.Println(queue.jobs[0]);
-	err := queue.Process(job.ID);
-	if err != nil {
-		queue.Nack(job.ID);
-	} else {
-		queue.Ack(job.ID);
-		queue.Remove(job.ID);
+	job2 := NewJob("Id2", "Hey body..", "nil" , "today");
+	queue.Add(job2);
+	job3 := NewJob("Id3", "Hey body..", "nil" , "today");
+	queue.Add(job3);
+	var wg sync.WaitGroup = sync.WaitGroup{};
+	for i := 0; i < 3; i++ {
+		wg.Add(1);
+		go worker(queue, &wg);
 	};
+	wg.Wait();
 };
