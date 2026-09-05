@@ -28,12 +28,13 @@ func (queue *Queue) CloseWhenDone() {
 	close(queue.jobs);
 };
 
-func (queue *Queue) Dequeue() (*Job,bool) {
+func (queue *Queue) Dequeue() (*Job,error) {
 	job, ok := <-queue.jobs;
 	if !ok {
-		return nil, false;
+		err := fmt.Errorf("Failed to recieve value from the channel");
+		return nil, err;
 	};
-	return job,true;
+	return job,nil;
 };
 
 func (queue *Queue) Process(job *Job) error {
