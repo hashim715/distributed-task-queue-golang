@@ -42,7 +42,7 @@ func main() {
 		cancel();
 	}();
 
-	queue := NewRedisQueue(rdb, "jobs-list");
+	queue := NewRedisQueue(rdb, "jobs-pending");
 
 	var wg sync.WaitGroup = sync.WaitGroup{};
 	for i := 0; i < 3; i++ {

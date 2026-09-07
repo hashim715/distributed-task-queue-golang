@@ -42,12 +42,12 @@ func redisWorker(ctx context.Context,id int, q *RedisQueue, wg *sync.WaitGroup) 
 		fmt.Printf("worker %d: picked up job %s\n", id, job.ID)
 
 		if err := q.Process(ctx,&job); err != nil {
-			err := q.Nack(ctx, &job);
+			err := q.Nack(ctx, &job,jobStr);
 			if err != nil {
 				fmt.Println(err);
 			};
 		} else {
-			err := q.Ack(ctx,&job);
+			err := q.Ack(ctx,&job,jobStr);
 			if err != nil {
 				fmt.Println(err);
 			};

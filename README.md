@@ -19,12 +19,20 @@ shared across multiple worker processes.
     `sync.WaitGroup` so in-flight retries can never race with the channel closing
 - **Redis-backed queue** (`redis.go`) using Redis lists, so jobs can persist and be
   shared across multiple worker processes instead of living only in one process's
-  memory:
-  - `Enqueue` — JSON-encodes the job and `LPUSH`es it onto a shared list key
-  - `Dequeue` — `BRPOP`s the next job, blocking until one is available or `ctx` is cancelled
-  - `Process` — same simulated work/failure behavior as the in-memory queue
-  - `Ack` — marks a job completed and removes it from the list
-  - `Nack` — marks a job failed; re-`LPUSH`es it (up to `maxRetries`) or gives up
+  memory. Uses a reliable-queue pattern with three named lists — `jobs-pending`,
+  `jobs-processing`, and `jobs-deadletter` — so a job is never silently dropped:
+  - `Enqueue` — JSON-encodes the job and `LPUSH`es it onto `jobs-pending`
+  - `Dequeue` — atomically `BLMOVE`s the next job from `jobs-pending` into
+    `jobs-processing`, blocking until one is available, the timeout elapses, or
+    `ctx` is cancelled — so a job stays visible in `jobs-processing` instead of
+    disappearing if a worker crashes mid-`Process`
+  - `Process` — same simulated work/failure behavior as the in-memory queue, but
+    also respects `ctx` cancellation so a cancelled context can interrupt the
+    simulated work rather than only being checked between jobs
+  - `Ack` — removes the job from `jobs-processing` and marks it completed
+  - `Nack` — removes the job from `jobs-processing`; re-`LPUSH`es it onto
+    `jobs-pending` (up to `maxRetries`), or, once retries are exhausted, marks it
+    `dead` and pushes it onto `jobs-deadletter` instead of dropping it
 - **Worker pools** for both queues: multiple goroutines concurrently pull jobs and
   process them, each logging its own ID as it picks up and finishes jobs
   (`worker.go` for the in-memory queue, `redis-worker.go` for the Redis queue)
@@ -41,12 +49,14 @@ to run workers in separate processes (or on separate machines) against the same 
 
 This project is a work in progress. Planned next steps:
 
-- [ ] Thread `context.Context` through `Process` on both queues so a cancelled
-      context can interrupt in-flight (simulated) work, not just the dequeue loop
-- [ ] Bound retry requeues (currently each retry spawns its own goroutine to send
-      without blocking the worker; fine at small scale, but unbounded under heavy load)
+- [ ] Thread `context.Context` through `Process` on the in-memory queue too (the
+      Redis queue's `Process` already respects cancellation)
+- [ ] Bound retry requeues on the in-memory queue (currently each retry spawns its
+      own goroutine to send without blocking the worker; fine at small scale, but
+      unbounded under heavy load)
+- [ ] Requeue/expire jobs stuck in `jobs-processing` from workers that crash before
+      calling `Ack`/`Nack`
 - [ ] Distributed coordination across multiple worker processes using the Redis queue
-- [ ] Dead-letter handling for jobs that exhaust their retries
 
 ## Requirements
 
