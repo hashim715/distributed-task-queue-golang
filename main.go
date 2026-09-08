@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 );
@@ -49,6 +50,8 @@ func main() {
 		wg.Add(1);
 		go redisWorker(ctx, i, queue, &wg);
 	};
+
+	go queue.ReapStale(ctx, 60*time.Second) // treat anything unclaimed > 60s as stale
 
 	job := NewJob("Id1", "Hey body..", "pending" , "today");
 	job2 := NewJob("Id2", "Hey body..", "pending" , "today");
