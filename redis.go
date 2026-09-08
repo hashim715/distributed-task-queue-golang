@@ -30,7 +30,7 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 
 func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
 	// BRPop blocks until something is available (or ctx is cancelled)
-	result, err := q.client.BLMove(ctx, q.key, "jobs-processing", "right", "left", 2*time.Second).Result();
+	result, err := q.client.BLMove(ctx, q.key, "jobs-processing", "right", "left", 10*time.Second).Result();
 
 	if err != nil {
 		return "", err;
@@ -45,7 +45,7 @@ func (q *RedisQueue) Process(ctx context.Context,job *Job) error {
 	job.Status = "running";
 	
 	select {
-	case <-time.After(15 * time.Second):
+	case <-time.After(5 * time.Second):
 	case <-ctx.Done():
 		return ctx.Err();
 	};
