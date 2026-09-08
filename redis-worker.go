@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -38,6 +39,8 @@ func redisWorker(ctx context.Context,id int, q *RedisQueue, wg *sync.WaitGroup) 
 			fmt.Printf("worker %d: bad job payload: %v\n", id, err)
 			continue
 		};
+
+		q.client.HSet(ctx, "jobs-processing-times", job.ID, time.Now().Unix());
 
 		fmt.Printf("worker %d: picked up job %s\n", id, job.ID)
 
