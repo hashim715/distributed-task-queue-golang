@@ -22,6 +22,12 @@ return "ok"
 `;
 
 // const dequeueScript = `
+// -- dequeueScript
+// -- KEYS[1] = jobs-pending
+// -- KEYS[2] = jobs-processing
+// -- KEYS[3] = jobs-processing-times
+// -- ARGV[1] = current unix timestamp
+
 // local job = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
 // if job == false then
 //     return nil
@@ -34,10 +40,10 @@ func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 	return &RedisQueue{client: client, key: key};
 };
 
-func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData string) error {
+func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData string,jobId string) error {
 	return q.client.Eval(ctx, removeFromProcessingScript,
 		[]string{"jobs-processing", "jobs-processing-times"},
-		originalData, originalData,
+		originalData, jobId,
 	).Err();
 };
 
@@ -114,7 +120,7 @@ func (q *RedisQueue) Process(ctx context.Context,job *Job) error {
 };
 
 func (q *RedisQueue) Ack(ctx context.Context, job *Job, originalData string) error {
-	if err := q.removeFromProcessing(ctx, originalData); err != nil {
+	if err := q.removeFromProcessing(ctx, originalData,job.ID); err != nil {
 		return err;
 	};
 
@@ -125,7 +131,7 @@ func (q *RedisQueue) Ack(ctx context.Context, job *Job, originalData string) err
 };
 
 func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cause error) error {
-	if err := q.removeFromProcessing(ctx, originalData); err != nil {
+	if err := q.removeFromProcessing(ctx, originalData,job.ID); err != nil {
 		return err
 	};
 
