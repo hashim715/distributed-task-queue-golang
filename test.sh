@@ -88,15 +88,17 @@ test_reaper() {
     PROG_PID=$!
 
     echo "==> Waiting for job to be fully claimed (in processing AND timed)..."
-    for i in $(seq 1 20); do
-    in_processing=$($REDIS LLEN jobs-processing)
-    has_timer=$($REDIS HLEN jobs-processing-times)
-    if [[ "$in_processing" -gt 0 && "$has_timer" -gt 0 ]]; then
-        echo "==> Job fully claimed after ${i} checks"
-        break
-    fi
-    sleep 0.2
-    done
+    sleep 1
+    
+    # for i in $(seq 1 20); do
+    # in_processing=$($REDIS LLEN jobs-processing)
+    # has_timer=$($REDIS HLEN jobs-processing-times)
+    # if [[ "$in_processing" -gt 0 && "$has_timer" -gt 0 ]]; then
+    #     echo "==> Job fully claimed after ${i} checks"
+    #     break
+    # fi
+    # sleep 0.2
+    # done
 
     echo "==> jobs-processing BEFORE kill (should contain CrashJob1):"
     $REDIS LRANGE jobs-processing 0 -1

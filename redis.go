@@ -21,29 +21,29 @@ redis.call('HDEL', KEYS[2], ARGV[2])
 return "ok"
 `;
 
-// const dequeueScript = `
-// -- dequeueScript
-// -- KEYS[1] = jobs-pending
-// -- KEYS[2] = jobs-processing
-// -- KEYS[3] = jobs-processing-times
-// -- ARGV[1] = current unix timestamp
+const dequeueScript = `
+-- dequeueScript
+-- KEYS[1] = jobs-pending
+-- KEYS[2] = jobs-processing
+-- KEYS[3] = jobs-processing-times
+-- ARGV[1] = current unix timestamp
 
-// local job = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
-// if job == false then
-//     return nil
-// end
-// redis.call('HSET', KEYS[3], job, ARGV[1])
-// return job
-// `;
+local job = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
+if job == false then
+    return nil
+end
+redis.call('HSET', KEYS[3], job, ARGV[1])
+return job
+`;
 
 func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 	return &RedisQueue{client: client, key: key};
 };
 
-func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData string,jobId string) error {
+func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData string) error {
 	return q.client.Eval(ctx, removeFromProcessingScript,
 		[]string{"jobs-processing", "jobs-processing-times"},
-		originalData, jobId,
+		originalData, originalData,
 	).Err();
 };
 
@@ -56,50 +56,43 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 };
 
 func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
-	// BRPop blocks until something is available (or ctx is cancelled)
-	result, err := q.client.BLMove(ctx, q.key, "jobs-processing", "right", "left", 15*time.Second).Result();
-
-	if err != nil {
-		return "", err;
-	};
-
-	var job Job;
-	if err := json.Unmarshal([]byte(result), &job); err == nil {
-		err := q.client.HSet(ctx, "jobs-processing-times", job.ID, time.Now().Unix()).Err();
-
+	tryDequeue := func() (string, bool, error) {
+		result, err := q.client.Eval(ctx, dequeueScript,
+			[]string{q.key, "jobs-processing", "jobs-processing-times"},
+			time.Now().Unix(),
+		).Result()
 		if err != nil {
-			return "",err;
-		};
-	};
+			return "", false, err
+		}
+		if result == nil {
+			return "", false, nil
+		}
+		return result.(string), true, nil
+	}
 
-	// BRPop returns [key, value] — we want the value
-	return result, nil;
+	if s, ok, err := tryDequeue(); err != nil {
+		return "", err
+	} else if ok {
+		return s, nil
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+			s, ok, err := tryDequeue()
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				return s, nil
+			}
+		}
+	}
 };
-
-// func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
-// 	ticker := time.NewTicker(200 * time.Millisecond)
-
-// 	defer ticker.Stop()
-
-// 	for {
-// 		select {
-// 		case <-ctx.Done():
-// 			return "", ctx.Err()
-// 		case <-ticker.C:
-// 			result, err := q.client.Eval(ctx, dequeueScript,
-// 				[]string{q.key, "jobs-processing", "jobs-processing-times"},
-// 				time.Now().Unix(),
-// 			).Result()
-// 			if err != nil {
-// 				return "", err
-// 			}
-// 			if result == nil {
-// 				continue // nothing available, poll again
-// 			}
-// 			return result.(string), nil
-// 		};
-// 	};
-// };
 
 func (q *RedisQueue) Process(ctx context.Context,job *Job) error {
 	fmt.Println("processing.....");
@@ -120,7 +113,7 @@ func (q *RedisQueue) Process(ctx context.Context,job *Job) error {
 };
 
 func (q *RedisQueue) Ack(ctx context.Context, job *Job, originalData string) error {
-	if err := q.removeFromProcessing(ctx, originalData,job.ID); err != nil {
+	if err := q.removeFromProcessing(ctx, originalData); err != nil {
 		return err;
 	};
 
@@ -131,7 +124,7 @@ func (q *RedisQueue) Ack(ctx context.Context, job *Job, originalData string) err
 };
 
 func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cause error) error {
-	if err := q.removeFromProcessing(ctx, originalData,job.ID); err != nil {
+	if err := q.removeFromProcessing(ctx, originalData); err != nil {
 		return err
 	};
 

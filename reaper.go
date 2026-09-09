@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -47,32 +46,9 @@ func (q *RedisQueue) reapOnce(ctx context.Context, staleAfter time.Duration) {
 		return;
 	};
 
-	rawJobs,err := q.client.LRange(ctx, "jobs-processing", 0, -1).Result();
-
-	if err != nil {
-		return;
-	};
-
-	type entry struct {
-		raw string
-		jobId string
-	};
-
-	entries := []entry{};
-
-	for _,raw := range rawJobs {
-		var parsedJob Job;
-
-		if err := json.Unmarshal([]byte(raw), &parsedJob); err != nil {
-			continue
-		};
-
-		entries = append(entries, entry{raw:raw, jobId:parsedJob.ID});
-	};
-
 	now := time.Now().Unix();
 
-	for jobID, claimedStr := range times {
+	for rawJob, claimedStr := range times {
 		claimedAt, err := strconv.ParseInt(claimedStr, 10, 64);
 
 		if err != nil {
@@ -83,25 +59,10 @@ func (q *RedisQueue) reapOnce(ctx context.Context, staleAfter time.Duration) {
 			continue; // not stale yet, skip (avoid an unnecessary Eval call)
 		};
 
-		var raw string;
-		var found bool = false;
-
-		for _, e := range entries {
-			if e.jobId == jobID {
-				raw = e.raw;
-				found = true;
-				break;
-			};
-		};
-
-		if (!found) {
-			continue; // job already gone from processing, nothing to reclaim
-		};
-
-		result, err := q.client.Eval(ctx, reapScript, []string{"jobs-processing-times", "jobs-processing", q.key}, jobID, now, int64(staleAfter.Seconds()), raw,).Result();
+		result, err := q.client.Eval(ctx, reapScript, []string{"jobs-processing-times", "jobs-processing", q.key}, rawJob, now, int64(staleAfter.Seconds()), rawJob,).Result();
 
 		if err != nil {
-			fmt.Printf("reaper: eval failed for %s: %v\n", jobID, err);
+			fmt.Printf("reaper: eval failed, %v\n", err);
 			continue;
 		};
 
@@ -111,7 +72,7 @@ func (q *RedisQueue) reapOnce(ctx context.Context, staleAfter time.Duration) {
 		case "not-stale":
 			// became fresh between our Go-side check and the script running — fine, skip
 		case "reclaimed":
-			fmt.Printf("reaper: job %s reclaimed, moved back to pending\n", jobID);
+			fmt.Printf("reaper: job %s reclaimed, moved back to pending\n",rawJob);
 		};
 	};
 };
