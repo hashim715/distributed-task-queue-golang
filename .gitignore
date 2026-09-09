@@ -1,12 +1,16 @@
 # Binaries
 /distributed_task_queue_golang
 /main
+/taskqueue
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 *.test
+
+# Common go build -o <name> output names used in this repo
+dtq_debug_bin
 
 # Go build/test artifacts
 *.out

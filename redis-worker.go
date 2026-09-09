@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,7 +28,7 @@ func redisWorker(ctx context.Context,id int, q *RedisQueue, wg *sync.WaitGroup) 
 			}
 			if err == redis.Nil {
 				continue // idle timeout, totally normal, not an error
-			}
+			};
 			fmt.Printf("worker %d: dequeue error: %v\n", id, err) // now only real errors land here
 			continue
 		};
@@ -40,19 +39,15 @@ func redisWorker(ctx context.Context,id int, q *RedisQueue, wg *sync.WaitGroup) 
 			continue
 		};
 
-		q.client.HSet(ctx, "jobs-processing-times", job.ID, time.Now().Unix());
-
 		fmt.Printf("worker %d: picked up job %s\n", id, job.ID)
 
-		if err := q.Process(ctx,&job); err != nil {
-			err := q.Nack(ctx, &job,jobStr);
-			if err != nil {
-				fmt.Println(err);
+		if procErr := q.Process(ctx,&job); procErr != nil {
+			if err := q.Nack(ctx, &job, jobStr, procErr); err != nil {
+				fmt.Printf("worker %d: nack failed for job %s: %v\n", id, job.ID, err);
 			};
 		} else {
-			err := q.Ack(ctx,&job,jobStr);
-			if err != nil {
-				fmt.Println(err);
+			if err := q.Ack(ctx,&job,jobStr); err != nil {
+				fmt.Printf("worker %d: ack failed for job %s: %v\n", id, job.ID, err);
 			};
 		};
 	};

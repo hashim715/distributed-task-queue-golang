@@ -15,23 +15,6 @@ import (
 func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", ContextTimeoutEnabled: true});
 
-	// err := rdb.Set(redis_ctx, "greeting", "hello redis!", 0).Err();
-	// if err != nil {
-	// 	panic(err);
-	// };
-
-	// val, err := rdb.Get(redis_ctx, "greeting").Result();
-	// if err != nil {
-	// 	panic(err);
-	// };
-	// fmt.Println("got back:",val);
-
-	// queue := NewQueue();
-
-	// queue.inFlight.Add(3);
-
-	// go queue.CloseWhenDone();
-
 	ctx, cancel := context.WithCancel(context.Background());
 
 	sigCh := make(chan os.Signal, 1);
@@ -51,15 +34,15 @@ func main() {
 		go redisWorker(ctx, i, queue, &wg);
 	};
 
-	go queue.ReapStale(ctx, 60*time.Second) // treat anything unclaimed > 60s as stale
+	go queue.ReapStale(ctx, 15*time.Second) // treat anything unclaimed > 15s as stale
 
-	job := NewJob("Id1", "Hey body..", "pending" , "today");
-	job2 := NewJob("Id2", "Hey body..", "pending" , "today");
-	job3 := NewJob("Id3", "Hey body..", "pending" , "today");
+	// job := NewJob("Id1", "Hey body..", "pending" , "today");
+	// job2 := NewJob("Id2", "Hey body..", "pending" , "today");
+	// job3 := NewJob("Id3", "Hey body..", "pending" , "today");
 
-	queue.Enqueue(ctx, job);
-	queue.Enqueue(ctx, job2);
-	queue.Enqueue(ctx, job3);
+	// queue.Enqueue(ctx, job);
+	// queue.Enqueue(ctx, job2);
+	// queue.Enqueue(ctx, job3);
 
 	wg.Wait();
 };
