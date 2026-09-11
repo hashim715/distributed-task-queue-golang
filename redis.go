@@ -36,6 +36,27 @@ redis.call('HSET', KEYS[3], job, ARGV[1])
 return job
 `;
 
+const scheduleReleaseScript = `
+-- scheduleReleaseScript
+-- KEYS[1] = jobs-scheduled (sorted set)
+-- KEYS[2] = jobs-pending (list)
+-- ARGV[1] = current unix timestamp
+-- ARGV[2] = max number of due jobs to release per call (safety cap)
+
+local due = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, tonumber(ARGV[2]))
+
+if #due == 0 then
+    return nil
+end
+
+for i, jobData in ipairs(due) do
+    redis.call('ZREM', KEYS[1], jobData)
+    redis.call('LPUSH', KEYS[2], jobData)
+end
+
+return #due
+`;
+
 func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 	return &RedisQueue{client: client, key: key};
 };
@@ -53,6 +74,47 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 		return err;
 	};
 	return q.client.LPush(ctx, q.key, data).Err();
+};
+
+func (q *RedisQueue) scheduleJobs(ctx context.Context, job *Job, runtime time.Time) error {
+	data, err := json.Marshal(job);
+
+	if err != nil {
+		return err;
+	};
+
+	return q.client.ZAdd(ctx, "jobs-scheduled", redis.Z{Score: float64(runtime.Unix()),Member: data}).Err();
+};
+
+func (q *RedisQueue) runScheduler(ctx context.Context)  {
+	ticker := time.NewTicker(time.Second * 2);
+
+	defer ticker.Stop();
+
+	for {
+		select {
+		case <-ctx.Done():
+			return;
+		case <-ticker.C:
+			now := time.Now().Unix();
+
+			scheduledJobs, err := q.client.Eval(ctx, scheduleReleaseScript, []string{"jobs-scheduled","jobs-pending"},now,100).Result();
+
+			if err != nil {
+				continue;
+			};
+
+			n, ok := scheduledJobs.(int64);
+			
+			if ok {
+				if n > 0 {
+					fmt.Printf("scheduler: released %d due job(s)\n", n);
+				};
+			} else {
+				fmt.Printf("scheduler: released 0 due job(s)\n");
+			};
+		};
+	};
 };
 
 func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {

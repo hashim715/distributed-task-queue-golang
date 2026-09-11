@@ -36,6 +36,8 @@ func main() {
 
 	go queue.ReapStale(ctx, 15*time.Second) // treat anything unclaimed > 15s as stale
 
+	go queue.runScheduler(ctx);
+
 	// job := NewJob("Id1", "Hey body..", "pending" , "today");
 	// job2 := NewJob("Id2", "Hey body..", "pending" , "today");
 	// job3 := NewJob("Id3", "Hey body..", "pending" , "today");
