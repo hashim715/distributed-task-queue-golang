@@ -6,11 +6,13 @@
 #   1. Normal processing (enqueue -> pending -> processing -> acked, list empties out)
 #   2. Crash + reaper recovery (kill -9 mid-job, confirm it's stuck, confirm reaper reclaims it)
 #   3. Dead-letter exhaustion (force max retries, confirm it lands in jobs-deadletter)
+#   4. Scheduled/delayed jobs (push into jobs-scheduled with a future score, confirm it
+#      stays put until due, then gets released into jobs-pending and processed)
 #
 # Requires: redis-cli reachable, a built binary named `taskqueue` in the current dir
 #           (build it first: go build -o taskqueue .)
 #
-# Usage: ./test_queue.sh [1|2|3|all]
+# Usage: ./test_queue.sh [1|2|3|4|all]
 
 set -uo pipefail
 
@@ -27,6 +29,18 @@ flush() {
 push_job() {
     local id="$1"
     $REDIS LPUSH jobs-pending \
+        "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Attempts\":0,\"CreatedAt\":\"today\"}" \
+        > /dev/null
+}
+
+# schedule_job <id> <run_in_seconds>
+# Mirrors scheduleJobs: ZADD into jobs-scheduled, scored by the Unix timestamp
+# the job should become due at (now + run_in_seconds).
+schedule_job() {
+    local id="$1"
+    local run_in="$2"
+    local score=$(($(date +%s) + run_in))
+    $REDIS ZADD jobs-scheduled "$score" \
         "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Attempts\":0,\"CreatedAt\":\"today\"}" \
         > /dev/null
 }
@@ -150,6 +164,48 @@ test_deadletter() {
     $REDIS LRANGE jobs-processing 0 -1
 }
 
+# ---- test 4: scheduled/delayed jobs -------------------------------------
+
+test_scheduled() {
+    section "TEST 4: Scheduled/delayed jobs"
+    flush
+
+    echo "==> Scheduling ScheduledJob1 to run 10s from now, ScheduledJob2 to run 60s from now"
+    schedule_job "ScheduledJob1" 10
+    schedule_job "ScheduledJob2" 60
+
+    echo "==> jobs-scheduled BEFORE run (expect both jobs, with future scores):"
+    $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
+
+    echo "==> jobs-pending BEFORE run (expect empty - nothing due yet):"
+    $REDIS LRANGE jobs-pending 0 -1
+
+    echo "==> Starting program for 20s (enough for the 10s job to become due,"
+    echo "==> get released by the scheduler, and get processed)"
+    "$BINARY" &
+    PROG_PID=$!
+
+    echo "==> Waiting 5s (still before ScheduledJob1 is due - should NOT be released yet)"
+    sleep 5
+    echo "==> jobs-scheduled at +5s (expect both jobs still present):"
+    $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
+    echo "==> jobs-pending at +5s (expect empty):"
+    $REDIS LRANGE jobs-pending 0 -1
+
+    echo "==> Waiting 15s more (ScheduledJob1 should now be due, released, and processed)"
+    sleep 15
+
+    kill "$PROG_PID" 2>/dev/null
+    wait "$PROG_PID" 2>/dev/null
+
+    echo "==> jobs-scheduled AFTER run (expect only ScheduledJob2 left - not due for 60s):"
+    $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
+    echo "==> jobs-pending AFTER run (expect empty - ScheduledJob1 released and consumed):"
+    $REDIS LRANGE jobs-pending 0 -1
+    echo "==> jobs-processing AFTER run (expect empty if ScheduledJob1 finished cleanly):"
+    $REDIS LRANGE jobs-processing 0 -1
+}
+
 # ---- runner -------------------------------------------------------------
 
 if [[ ! -x "$BINARY" ]]; then
@@ -162,13 +218,15 @@ case "${1:-all}" in
     1) test_normal ;;
     2) test_reaper ;;
     3) test_deadletter ;;
+    4) test_scheduled ;;
     all)
         test_normal
         test_reaper
         test_deadletter
+        test_scheduled
         ;;
     *)
-        echo "Usage: $0 [1|2|3|all]"
+        echo "Usage: $0 [1|2|3|4|all]"
         exit 1
         ;;
 esac
