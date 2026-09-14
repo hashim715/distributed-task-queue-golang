@@ -15,6 +15,8 @@ type RedisQueue struct {
 	key string
 };
 
+const SOME_LARGE_OFFSET uint64 = 10_000_000_000;
+
 const removeFromProcessingScript = `
 redis.call('LREM', KEYS[1], 1, ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[2])
@@ -22,36 +24,44 @@ return "ok"
 `;
 
 const dequeueScript = `
--- dequeueScript
--- KEYS[1] = jobs-pending
+-- priorityDequeueScript
+-- KEYS[1] = jobs-pending (sorted set now, not a list)
 -- KEYS[2] = jobs-processing
 -- KEYS[3] = jobs-processing-times
 -- ARGV[1] = current unix timestamp
 
-local job = redis.call('LMOVE', KEYS[1], KEYS[2], 'RIGHT', 'LEFT')
-if job == false then
+local popped = redis.call('ZPOPMIN', KEYS[1])
+if #popped == 0 then
     return nil
 end
-redis.call('HSET', KEYS[3], job, ARGV[1])
-return job
+
+local jobData = popped[1] -- ZPOPMIN returns [member, score]
+redis.call('LPUSH', KEYS[2], jobData)
+redis.call('HSET', KEYS[3], jobData, ARGV[1])
+return jobData
 `;
 
 const scheduleReleaseScript = `
 -- scheduleReleaseScript
--- KEYS[1] = jobs-scheduled (sorted set)
--- KEYS[2] = jobs-pending (list)
+-- KEYS[1] = jobs-scheduled (sorted set, scored by run-at time)
+-- KEYS[2] = jobs-pending (sorted set, scored by priority)
 -- ARGV[1] = current unix timestamp
--- ARGV[2] = max number of due jobs to release per call (safety cap)
+-- ARGV[2] = max number of due jobs to release per call
+-- ARGV[3] = SOME_LARGE_OFFSET (passed from Go, keeps the formula in one place)
 
 local due = redis.call('ZRANGE', KEYS[1], '-inf', ARGV[1], 'BYSCORE', 'LIMIT', 0, tonumber(ARGV[2]))
 
 if #due == 0 then
-    return nil
+    return 0
 end
 
 for i, jobData in ipairs(due) do
     redis.call('ZREM', KEYS[1], jobData)
-    redis.call('LPUSH', KEYS[2], jobData)
+
+    local decoded = cjson.decode(jobData)
+    local score = (decoded.priority * tonumber(ARGV[3])) + tonumber(ARGV[1])
+
+    redis.call('ZADD', KEYS[2], score, jobData)
 end
 
 return #due
@@ -70,10 +80,18 @@ func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData stri
 
 func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 	data, err := json.Marshal(job);
+
 	if err != nil {
 		return err;
 	};
-	return q.client.LPush(ctx, q.key, data).Err();
+
+	unix_timestamp := time.Now().Unix();
+
+	score := (uint64(job.Priority) * SOME_LARGE_OFFSET) + uint64(unix_timestamp);
+
+	return q.client.ZAdd(ctx, q.key, redis.Z{Score: float64(score), Member: data}).Err();
+	
+	// return q.client.LPush(ctx, q.key, data).Err();
 };
 
 func (q *RedisQueue) scheduleJobs(ctx context.Context, job *Job, runtime time.Time) error {
@@ -98,7 +116,7 @@ func (q *RedisQueue) runScheduler(ctx context.Context)  {
 		case <-ticker.C:
 			now := time.Now().Unix();
 
-			scheduledJobs, err := q.client.Eval(ctx, scheduleReleaseScript, []string{"jobs-scheduled","jobs-pending"},now,100).Result();
+			scheduledJobs, err := q.client.Eval(ctx, scheduleReleaseScript, []string{"jobs-scheduled","jobs-pending"},now,100,SOME_LARGE_OFFSET,).Result();
 
 			if err != nil {
 				continue;
@@ -111,7 +129,7 @@ func (q *RedisQueue) runScheduler(ctx context.Context)  {
 					fmt.Printf("scheduler: released %d due job(s)\n", n);
 				};
 			} else {
-				fmt.Printf("scheduler: released 0 due job(s)\n");
+				// fmt.Printf("scheduler: released 0 due job(s)\n");
 			};
 		};
 	};
@@ -122,24 +140,28 @@ func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
 		result, err := q.client.Eval(ctx, dequeueScript,
 			[]string{q.key, "jobs-processing", "jobs-processing-times"},
 			time.Now().Unix(),
-		).Result()
+		).Result();
+
 		if err != nil {
 			return "", false, err
-		}
+		};
+
 		if result == nil {
 			return "", false, nil
-		}
+		};
+
 		return result.(string), true, nil
-	}
+	};
 
 	if s, ok, err := tryDequeue(); err != nil {
-		return "", err
+		return "", err;
 	} else if ok {
-		return s, nil
-	}
+		return s, nil;
+	};
 
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond);
+	defer ticker.Stop();
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -148,12 +170,12 @@ func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
 			s, ok, err := tryDequeue()
 			if err != nil {
 				return "", err
-			}
+			};
 			if ok {
 				return s, nil
-			}
-		}
-	}
+			};
+		};
+	};
 };
 
 func (q *RedisQueue) Process(ctx context.Context,job *Job) error {
@@ -195,11 +217,16 @@ func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cau
 		job.Status = "pending";
 
 		data, err := json.Marshal(job);
+
 		if err != nil {
 			return err;
 		};
 
-		if err := q.client.LPush(ctx, q.key, data).Err(); err != nil {
+		unix_timestamp := time.Now().Unix();
+
+		score := (uint64(job.Priority) * SOME_LARGE_OFFSET) + uint64(unix_timestamp);
+
+	    if err := q.client.ZAdd(ctx, q.key, redis.Z{Score: float64(score), Member: data}).Err(); err != nil {
 			return err;
 		};
 

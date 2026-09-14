@@ -8,6 +8,14 @@ import (
 );
 
 const reapScript = `
+-- KEYS[1] = jobs-processing-times
+-- KEYS[2] = jobs-processing
+-- KEYS[3] = jobs-pending (sorted set, scored by priority)
+-- ARGV[1] = rawjob (string)
+-- ARGV[2] = unit timestamp
+-- ARGV[3] = staleAfter (seconds)
+-- ARGV[4] = SOME_LARGE_OFFSET (passed from Go, keeps the formula in one place)
+
 local claimedAt = redis.call('HGET', KEYS[1], ARGV[1])
 
 if claimedAt == false then
@@ -18,9 +26,14 @@ if (tonumber(ARGV[2]) - tonumber(claimedAt)) <= tonumber(ARGV[3]) then
     return "not-stale"
 end
 
-redis.call('LREM', KEYS[2], 1, ARGV[4])
+redis.call('LREM', KEYS[2], 1, ARGV[1])
 redis.call('HDEL', KEYS[1], ARGV[1])
-redis.call('LPUSH', KEYS[3], ARGV[4])
+
+local decoded = cjson.decode(ARGV[1])
+local score = (decoded.priority * tonumber(ARGV[4])) + tonumber(ARGV[2])
+
+redis.call('ZADD', KEYS[3], score, ARGV[1])
+
 return "reclaimed"
 `;
 
@@ -59,7 +72,7 @@ func (q *RedisQueue) reapOnce(ctx context.Context, staleAfter time.Duration) {
 			continue; // not stale yet, skip (avoid an unnecessary Eval call)
 		};
 
-		result, err := q.client.Eval(ctx, reapScript, []string{"jobs-processing-times", "jobs-processing", q.key}, rawJob, now, int64(staleAfter.Seconds()), rawJob,).Result();
+		result, err := q.client.Eval(ctx, reapScript, []string{"jobs-processing-times", "jobs-processing", q.key}, rawJob, now, int64(staleAfter.Seconds()),SOME_LARGE_OFFSET).Result();
 
 		if err != nil {
 			fmt.Printf("reaper: eval failed, %v\n", err);

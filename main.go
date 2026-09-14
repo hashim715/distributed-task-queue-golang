@@ -38,9 +38,9 @@ func main() {
 
 	go queue.runScheduler(ctx);
 
-	// job := NewJob("Id1", "Hey body..", "pending" , "today");
-	// job2 := NewJob("Id2", "Hey body..", "pending" , "today");
-	// job3 := NewJob("Id3", "Hey body..", "pending" , "today");
+	// job := NewJob("Id1", "Hey body..", "pending" , "today",0);
+	// job2 := NewJob("Id2", "Hey body..", "pending" , "today",1);
+	// job3 := NewJob("Id3", "Hey body..", "pending" , "today",2);
 
 	// queue.Enqueue(ctx, job);
 	// queue.Enqueue(ctx, job2);

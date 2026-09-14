@@ -8,11 +8,14 @@
 #   3. Dead-letter exhaustion (force max retries, confirm it lands in jobs-deadletter)
 #   4. Scheduled/delayed jobs (push into jobs-scheduled with a future score, confirm it
 #      stays put until due, then gets released into jobs-pending and processed)
+#   5. Priority ordering (jobs-pending is a sorted set scored by priority; push jobs
+#      out of order and confirm ZRANGE returns them lowest-score-first, i.e. urgent
+#      before high before normal before low)
 #
 # Requires: redis-cli reachable, a built binary named `taskqueue` in the current dir
 #           (build it first: go build -o taskqueue .)
 #
-# Usage: ./test_queue.sh [1|2|3|4|all]
+# Usage: ./test.sh [1|2|3|4|5|all]
 
 set -uo pipefail
 
@@ -26,22 +29,41 @@ flush() {
     $REDIS FLUSHALL > /dev/null
 }
 
+# priority_score <priority>
+SOME_LARGE_OFFSET=10000000000
+
+priority_score() {
+    local priority="$1"
+    echo $(( (priority * SOME_LARGE_OFFSET) + $(date +%s) ))
+}
+
+# push_job <id> [priority]
 push_job() {
     local id="$1"
-    $REDIS LPUSH jobs-pending \
-        "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Attempts\":0,\"CreatedAt\":\"today\"}" \
+
+    local priority="${2:-2}"
+
+    local score
+
+    score=$(priority_score "$priority")
+
+    $REDIS ZADD jobs-pending "$score" \
+        "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Priority\":$priority,\"Attempts\":0,\"CreatedAt\":\"today\"}" \
         > /dev/null
 }
 
-# schedule_job <id> <run_in_seconds>
-# Mirrors scheduleJobs: ZADD into jobs-scheduled, scored by the Unix timestamp
-# the job should become due at (now + run_in_seconds).
+# schedule_job <id> <run_in_seconds> [priority]
 schedule_job() {
     local id="$1"
+
     local run_in="$2"
+
+    local priority="${3:-2}"
+
     local score=$(($(date +%s) + run_in))
+
     $REDIS ZADD jobs-scheduled "$score" \
-        "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Attempts\":0,\"CreatedAt\":\"today\"}" \
+        "{\"ID\":\"$id\",\"Payload\":\"payload for $id\",\"Status\":\"pending\",\"Priority\":$priority,\"Attempts\":0,\"CreatedAt\":\"today\"}" \
         > /dev/null
 }
 
@@ -75,13 +97,13 @@ test_normal() {
         push_job "NormalJob$i"
     done
     echo "==> jobs-pending length before run:"
-    $REDIS LLEN jobs-pending
+    $REDIS ZCARD jobs-pending
 
     echo "==> Starting program for 15s to let jobs process"
     timeout 15 "$BINARY" || true
 
     echo "==> jobs-pending length after run (expect 0):"
-    $REDIS LLEN jobs-pending
+    $REDIS ZCARD jobs-pending
     echo "==> jobs-processing length after run (expect 0 if nothing crashed):"
     $REDIS LLEN jobs-processing
     echo "==> jobs-processing-times entries (expect 0 if all cleanly acked/nacked):"
@@ -137,7 +159,7 @@ test_reaper() {
     echo "==> jobs-processing AFTER reaper cycle (expect empty - job reclaimed):"
     $REDIS LRANGE jobs-processing 0 -1
     echo "==> jobs-pending AFTER reaper cycle (job may be here if reclaimed but not yet reprocessed):"
-    $REDIS LRANGE jobs-pending 0 -1
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
 }
 
 # ---- test 3: dead-letter exhaustion -------------------------------------
@@ -159,7 +181,7 @@ test_deadletter() {
     echo "==> jobs-deadletter contents:"
     $REDIS LRANGE jobs-deadletter 0 -1
     echo "==> jobs-pending (should be empty - everything either acked or dead-lettered):"
-    $REDIS LRANGE jobs-pending 0 -1
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
     echo "==> jobs-processing (should be empty):"
     $REDIS LRANGE jobs-processing 0 -1
 }
@@ -178,7 +200,7 @@ test_scheduled() {
     $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
 
     echo "==> jobs-pending BEFORE run (expect empty - nothing due yet):"
-    $REDIS LRANGE jobs-pending 0 -1
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
 
     echo "==> Starting program for 20s (enough for the 10s job to become due,"
     echo "==> get released by the scheduler, and get processed)"
@@ -190,7 +212,7 @@ test_scheduled() {
     echo "==> jobs-scheduled at +5s (expect both jobs still present):"
     $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
     echo "==> jobs-pending at +5s (expect empty):"
-    $REDIS LRANGE jobs-pending 0 -1
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
 
     echo "==> Waiting 15s more (ScheduledJob1 should now be due, released, and processed)"
     sleep 15
@@ -201,9 +223,39 @@ test_scheduled() {
     echo "==> jobs-scheduled AFTER run (expect only ScheduledJob2 left - not due for 60s):"
     $REDIS ZRANGE jobs-scheduled 0 -1 WITHSCORES
     echo "==> jobs-pending AFTER run (expect empty - ScheduledJob1 released and consumed):"
-    $REDIS LRANGE jobs-pending 0 -1
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
     echo "==> jobs-processing AFTER run (expect empty if ScheduledJob1 finished cleanly):"
     $REDIS LRANGE jobs-processing 0 -1
+}
+
+# ---- test 5: priority ordering -------------------------------------------
+
+test_priority() {
+    section "TEST 5: Priority ordering"
+    flush
+
+    echo "==> Pushing jobs out of priority order: low(3), normal(2), urgent(0), high(1)"
+    push_job "LowJob" 3
+    push_job "NormalJob" 2
+    push_job "UrgentJob" 0
+    push_job "HighJob" 1
+
+    echo "==> jobs-pending BEFORE run, ordered by score (ZPOPMIN drains lowest first)."
+    echo "==> Expect: UrgentJob, HighJob, NormalJob, LowJob:"
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
+
+    echo "==> Starting program and capturing worker pickup order for 15s"
+    echo "==> NOTE: main.go runs 3 concurrent workers, so this isn't a strict"
+    echo "==> single-file-line race — with multiple idle workers, more than one"
+    echo "==> can claim a job in the same tick. Process() also has a ~50% random"
+    echo "==> failure rate, so a job may be Nacked and reappear (re-scored at"
+    echo "==> current time, same priority) more than once in this log. The"
+    echo "==> reliable assertion is the ZRANGE score ordering above, not the"
+    echo "==> picked-up log order/count below."
+    timeout 15 "$BINARY" 2>&1 | grep "picked up job" || true
+
+    echo "==> jobs-pending AFTER run (expect empty - all jobs drained):"
+    $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
 }
 
 # ---- runner -------------------------------------------------------------
@@ -219,14 +271,16 @@ case "${1:-all}" in
     2) test_reaper ;;
     3) test_deadletter ;;
     4) test_scheduled ;;
+    5) test_priority ;;
     all)
         test_normal
         test_reaper
         test_deadletter
         test_scheduled
+        test_priority
         ;;
     *)
-        echo "Usage: $0 [1|2|3|4|all]"
+        echo "Usage: $0 [1|2|3|4|5|all]"
         exit 1
         ;;
 esac
