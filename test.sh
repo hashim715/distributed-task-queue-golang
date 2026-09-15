@@ -11,11 +11,14 @@
 #   5. Priority ordering (jobs-pending is a sorted set scored by priority; push jobs
 #      out of order and confirm ZRANGE returns them lowest-score-first, i.e. urgent
 #      before high before normal before low)
+#   6. Job metadata (job:<ID> hash tracks status/attempts across the job's lifecycle;
+#      confirm it goes pending -> running -> completed, and that attempts increments
+#      on a retry)
 #
 # Requires: redis-cli reachable, a built binary named `taskqueue` in the current dir
 #           (build it first: go build -o taskqueue .)
 #
-# Usage: ./test.sh [1|2|3|4|5|all]
+# Usage: ./test.sh [1|2|3|4|5|6|all]
 
 set -uo pipefail
 
@@ -258,6 +261,45 @@ test_priority() {
     $REDIS ZRANGE jobs-pending 0 -1 WITHSCORES
 }
 
+# ---- test 6: job metadata -------------------------------------------------
+
+test_metadata() {
+    section "TEST 6: Job metadata"
+    flush
+
+    echo "==> Pushing MetaJob1 via redis-cli (bypasses Go's Enqueue, so no job:MetaJob1"
+    echo "==> hash exists yet - only Enqueue itself writes the initial metadata):"
+    push_job "MetaJob1"
+    $REDIS HGETALL job:MetaJob1
+
+    echo "==> Starting program for 15s to let the job run to a terminal state"
+    timeout 15 "$BINARY" || true
+
+    echo "==> job:MetaJob1 AFTER run (status should be completed or dead, attempts > 0"
+    echo "==> if it was ever retried):"
+    $REDIS HGETALL job:MetaJob1
+
+    echo
+    echo "==> Re-running with maxRetries effectively forced low isn't done here (see"
+    echo "==> TEST 3's note) - instead just confirm attempts tracks retries on a fresh job."
+    echo "==> NOT flushing here (would also wipe job:MetaJob1, which we still check below):"
+    push_job "MetaJob2"
+    echo "==> job:MetaJob2 attempts BEFORE run (expect empty - same redis-cli caveat as above):"
+    $REDIS HGET job:MetaJob2 attempts
+
+    timeout 15 "$BINARY" || true
+
+    echo "==> job:MetaJob2 AFTER run (attempts should be >= 1 if it failed at least"
+    echo "==> once before reaching a terminal state, per Process()'s ~50% fail rate):"
+    $REDIS HGETALL job:MetaJob2
+
+    echo
+    echo "==> job:MetaJob1/MetaJob2 TTL in seconds (expect ~86400 / 24h - set once a"
+    echo "==> job reaches a terminal state; -1 would mean no expiry, -2 means gone):"
+    $REDIS TTL job:MetaJob1
+    $REDIS TTL job:MetaJob2
+}
+
 # ---- runner -------------------------------------------------------------
 
 if [[ ! -x "$BINARY" ]]; then
@@ -272,15 +314,17 @@ case "${1:-all}" in
     3) test_deadletter ;;
     4) test_scheduled ;;
     5) test_priority ;;
+    6) test_metadata ;;
     all)
         test_normal
         test_reaper
         test_deadletter
         test_scheduled
         test_priority
+        test_metadata
         ;;
     *)
-        echo "Usage: $0 [1|2|3|4|5|all]"
+        echo "Usage: $0 [1|2|3|4|5|6|all]"
         exit 1
         ;;
 esac

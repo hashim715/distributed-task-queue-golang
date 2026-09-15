@@ -18,8 +18,14 @@ type RedisQueue struct {
 const SOME_LARGE_OFFSET uint64 = 10_000_000_000;
 
 const removeFromProcessingScript = `
+-- KEYS[1] = jobs-processing
+-- KEYS[2] = jobs-processing-times
+-- ARGV[1] = rawJob (string)
+
 redis.call('LREM', KEYS[1], 1, ARGV[1])
-redis.call('HDEL', KEYS[2], ARGV[2])
+
+redis.call('HDEL', KEYS[2], ARGV[1])
+
 return "ok"
 `;
 
@@ -36,8 +42,11 @@ if #popped == 0 then
 end
 
 local jobData = popped[1] -- ZPOPMIN returns [member, score]
+
 redis.call('LPUSH', KEYS[2], jobData)
+
 redis.call('HSET', KEYS[3], jobData, ARGV[1])
+
 return jobData
 `;
 
@@ -67,6 +76,18 @@ end
 return #due
 `;
 
+const addMetadataScript = `
+-- KEYS[1] = job:ID
+
+-- ARGV[1] = status
+-- ARGV[2] = attempts
+-- ARGV[3] = unix timestamp
+
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'attempts', ARGV[2], 'updated_at', ARGV[3])
+
+return "ok"
+`;
+
 func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 	return &RedisQueue{client: client, key: key};
 };
@@ -74,8 +95,24 @@ func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 func (q *RedisQueue) removeFromProcessing(ctx context.Context, originalData string) error {
 	return q.client.Eval(ctx, removeFromProcessingScript,
 		[]string{"jobs-processing", "jobs-processing-times"},
-		originalData, originalData,
+		originalData,
 	).Err();
+};
+
+func (q *RedisQueue) setJobMetadata(ctx context.Context, job *Job) error {
+	key := "job:" + job.ID;
+
+	if err := q.client.Eval(ctx, addMetadataScript, []string{key},job.Status,job.Attempts,time.Now().Unix()).Err(); err != nil {
+		return err;
+	};
+
+	// Only terminal states get a TTL - a job still pending/running should stay
+	// queryable indefinitely, since it isn't done yet.
+	if job.Status == "completed" || job.Status == "dead" {
+		return q.client.Expire(ctx, key, 24*time.Hour).Err()
+	};
+
+	return nil;
 };
 
 func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
@@ -87,11 +124,23 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 
 	unix_timestamp := time.Now().Unix();
 
+	key := "job:" + job.ID;
+
+	// Seeds the full metadata hash (including fields setJobMetadata never touches,
+	// like priority/created_at) since this is the job's first write; later
+	// lifecycle transitions go through setJobMetadata instead.
+	if err := q.client.HSet(ctx, key, map[string]interface{}{
+		"status":     job.Status,
+		"attempts":   job.Attempts,
+		"priority":   job.Priority,
+		"created_at": job.CreatedAt,
+	}).Err(); err != nil {
+		return err;
+	};
+
 	score := (uint64(job.Priority) * SOME_LARGE_OFFSET) + uint64(unix_timestamp);
 
 	return q.client.ZAdd(ctx, q.key, redis.Z{Score: float64(score), Member: data}).Err();
-	
-	// return q.client.LPush(ctx, q.key, data).Err();
 };
 
 func (q *RedisQueue) scheduleJobs(ctx context.Context, job *Job, runtime time.Time) error {
@@ -204,6 +253,10 @@ func (q *RedisQueue) Ack(ctx context.Context, job *Job, originalData string) err
 	job.Status = "completed";
 	fmt.Printf("Acknowledged the job with id: %s\n", job.ID);
 
+	if err := q.setJobMetadata(ctx, job); err != nil {
+		return err;
+	};
+
 	return nil;
 };
 
@@ -213,6 +266,7 @@ func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cau
 	};
 
 	job.Attempts++;
+
 	if job.Attempts < maxRetries {
 		job.Status = "pending";
 
@@ -232,6 +286,10 @@ func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cau
 
 		fmt.Printf("job %s: failed (%v), retrying (attempt %d/%d)\n", job.ID, cause, job.Attempts, maxRetries);
 
+		if err := q.setJobMetadata(ctx, job); err != nil {
+			return err;
+		};
+
 		return nil;
 	};
 
@@ -248,6 +306,10 @@ func (q *RedisQueue) Nack(ctx context.Context,job *Job, originalData string, cau
 	};
 
 	fmt.Printf("job %s: exhausted retries after %d attempts (%v), moved to dead-letter\n", job.ID, job.Attempts, cause);
+
+	if err := q.setJobMetadata(ctx, job); err != nil {
+		return err;
+	};
 
 	return nil;
 };

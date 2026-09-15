@@ -58,6 +58,18 @@ shared across multiple worker processes.
     them from `jobs-scheduled`, and `ZADD`s each onto `jobs-pending` with its
     priority score computed at release time — so a delayed job still gets prioritized
     correctly once it becomes eligible to run
+  - **Job metadata** — a `job:<ID>` Redis hash (`status`, `attempts`, `priority`,
+    `created_at`, `updated_at`) tracks each job's lifecycle independently of where
+    it currently sits in the queue, so a caller can check on a job's status after
+    enqueueing it without needing to scan `jobs-pending`/`jobs-processing`. Written
+    at `Enqueue` (full seed), then updated by the worker when it starts running the
+    job, and by `Ack`/`Nack`/the reaper's reclaim path on every subsequent
+    transition. Once a job reaches a terminal state (`completed` or `dead`), its
+    hash gets a 24-hour TTL so it doesn't accumulate forever — a still-pending or
+    -running job's hash has no expiry. One caveat: if the worker's post-pickup
+    metadata write itself fails, the worker abandons that job in `jobs-processing`
+    rather than processing it anyway — recovery then depends on the stale-job
+    reaper reclaiming it later, same as a crashed worker
 - **Stale-job reaper** (`reaper.go`): a background goroutine (ticking every few
   seconds) that scans `jobs-processing-times` for jobs claimed longer than a
   configurable `staleAfter` window — catching jobs left behind by a worker that
@@ -73,8 +85,8 @@ shared across multiple worker processes.
   the queue is drained
 - **End-to-end test script** (`test.sh`): exercises the Redis queue against a real
   Redis instance — normal processing, crash + reaper recovery (`kill -9` mid-job),
-  dead-letter exhaustion, scheduled/delayed job release, and priority ordering —
-  inspecting queue state via `redis-cli` between runs
+  dead-letter exhaustion, scheduled/delayed job release, priority ordering, and job
+  metadata tracking — inspecting queue state via `redis-cli` between runs
 
 Using a channel instead of a shared slice means concurrent access to the in-memory
 queue is safe without a manual mutex — sends/receives are synchronized by the Go
@@ -97,6 +109,9 @@ This project is a work in progress. Planned next steps:
 - [x] Priority queueing — `jobs-pending` is a priority-scored sorted set instead of a
       plain FIFO list, so urgent jobs jump ahead of lower-priority ones
 - [x] Delayed/scheduled job execution via `jobs-scheduled`
+- [x] Persistent per-job status metadata (`job:<ID>` hash), queryable independently
+      of the job's current position in the queue, expiring 24h after the job reaches
+      a terminal state
 - [ ] Distributed coordination across multiple worker processes using the Redis queue
 
 ## Requirements

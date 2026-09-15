@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -85,7 +86,20 @@ func (q *RedisQueue) reapOnce(ctx context.Context, staleAfter time.Duration) {
 		case "not-stale":
 			// became fresh between our Go-side check and the script running — fine, skip
 		case "reclaimed":
-			fmt.Printf("reaper: job %s reclaimed, moved back to pending\n",rawJob);
+			var job Job;
+			
+			if err := json.Unmarshal([]byte(rawJob), &job); err != nil {
+				fmt.Printf("reaper: bad job payload during metadata update: %v\n", err);
+				continue;
+			};
+
+			job.Status = "pending";
+
+			if err := q.setJobMetadata(ctx, &job); err != nil {
+				fmt.Printf("reaper: metadata update failed for %s: %v\n", job.ID, err);
+			};
+
+			fmt.Printf("reaper: job %s reclaimed, moved back to pending\n", job.ID);
 		};
 	};
 };

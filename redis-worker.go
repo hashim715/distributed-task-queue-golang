@@ -41,6 +41,14 @@ func redisWorker(ctx context.Context,id int, q *RedisQueue, wg *sync.WaitGroup) 
 
 		fmt.Printf("worker %d: picked up job %s\n", id, job.ID)
 
+		job.Status = "running";
+		// If this metadata write fails, the job is abandoned in jobs-processing
+		// here rather than proceeding to Process/Ack/Nack - the stale-job reaper
+		// is what eventually reclaims it back onto jobs-pending.
+		if err := q.setJobMetadata(ctx, &job); err != nil {
+			continue;
+		};
+
 		if procErr := q.Process(ctx,&job); procErr != nil {
 			if err := q.Nack(ctx, &job, jobStr, procErr); err != nil {
 				fmt.Printf("worker %d: nack failed for job %s: %v\n", id, job.ID, err);
