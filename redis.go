@@ -88,6 +88,37 @@ redis.call('HSET', KEYS[1], 'status', ARGV[1], 'attempts', ARGV[2], 'updated_at'
 return "ok"
 `;
 
+const enqueueScript = `
+-- KEYS[1] = job:ID
+-- KEYS[2] = jobs-pending (sorted set, scored by priority)
+-- ARGV[1] = status
+-- ARGV[2] = attempts
+-- ARGV[3] = priority
+-- ARGV[4] = created_at
+-- ARGV[5] = rawJob (JSON string, also the sorted-set member)
+-- ARGV[6] = score for jobs-pending
+
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'attempts', ARGV[2], 'priority', ARGV[3], 'created_at', ARGV[4])
+redis.call('ZADD', KEYS[2], ARGV[6], ARGV[5])
+
+return "ok"
+`;
+
+const scheduleJobScript = `
+-- KEYS[1] = job:ID
+-- KEYS[2] = jobs-scheduled (sorted set, scored by run-at time)
+-- ARGV[1] = attempts
+-- ARGV[2] = priority
+-- ARGV[3] = created_at
+-- ARGV[4] = rawJob (JSON string, also the sorted-set member)
+-- ARGV[5] = run-at unix timestamp (score for jobs-scheduled)
+
+redis.call('HSET', KEYS[1], 'status', 'scheduled', 'attempts', ARGV[1], 'priority', ARGV[2], 'created_at', ARGV[3])
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
+
+return "ok"
+`;
+
 func NewRedisQueue(client *redis.Client, key string) *RedisQueue {
 	return &RedisQueue{client: client, key: key};
 };
@@ -126,21 +157,30 @@ func (q *RedisQueue) Enqueue(ctx context.Context, job *Job) error {
 
 	key := "job:" + job.ID;
 
-	// Seeds the full metadata hash (including fields setJobMetadata never touches,
-	// like priority/created_at) since this is the job's first write; later
-	// lifecycle transitions go through setJobMetadata instead.
-	if err := q.client.HSet(ctx, key, map[string]interface{}{
-		"status":     job.Status,
-		"attempts":   job.Attempts,
-		"priority":   job.Priority,
-		"created_at": job.CreatedAt,
-	}).Err(); err != nil {
-		return err;
-	};
-
 	score := (uint64(job.Priority) * SOME_LARGE_OFFSET) + uint64(unix_timestamp);
 
-	return q.client.ZAdd(ctx, q.key, redis.Z{Score: float64(score), Member: data}).Err();
+	return q.client.Eval(ctx, enqueueScript,
+		[]string{key, q.key},
+		job.Status, job.Attempts, job.Priority, job.CreatedAt, string(data), score,
+	).Err();
+};
+
+func (q *RedisQueue) GetJob(ctx context.Context, id string) (map[string]string,error) {
+	key := "job:" + id;
+
+	result,err := q.client.HGetAll(ctx, key).Result(); 
+
+	if err != nil {
+		return nil,err;
+	};
+
+	if len(result) == 0 {
+		return nil,nil;
+	};
+
+	result["id"] = id;
+
+	return result,nil;
 };
 
 func (q *RedisQueue) scheduleJobs(ctx context.Context, job *Job, runtime time.Time) error {
@@ -150,7 +190,12 @@ func (q *RedisQueue) scheduleJobs(ctx context.Context, job *Job, runtime time.Ti
 		return err;
 	};
 
-	return q.client.ZAdd(ctx, "jobs-scheduled", redis.Z{Score: float64(runtime.Unix()),Member: data}).Err();
+	key := "job:" + job.ID;
+	
+	return q.client.Eval(ctx, scheduleJobScript,
+		[]string{key, "jobs-scheduled"},
+		job.Attempts, job.Priority, job.CreatedAt, string(data), runtime.Unix(),
+	).Err();
 };
 
 func (q *RedisQueue) runScheduler(ctx context.Context)  {

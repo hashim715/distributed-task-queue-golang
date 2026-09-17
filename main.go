@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -20,13 +21,26 @@ func main() {
 	sigCh := make(chan os.Signal, 1);
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM);
 
+	queue := NewRedisQueue(rdb, "jobs-pending");
+
+	httpServer := NewHttpServer(":8080",queue);
+
 	go func() {
-		<-sigCh;
-		fmt.Println("shutdown requested...");
-		cancel();
+		fmt.Println("HTTP server listening on :8080");
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("HTTP server error: %v\n", err);
+		};
 	}();
 
-	queue := NewRedisQueue(rdb, "jobs-pending");
+	go func() {
+		<-sigCh                          // 1. OS signal received (Ctrl+C)
+		fmt.Println("shutdown requested...")
+		cancel()                         // 2. Tell workers/reaper/scheduler to stop (they're watching ctx.Done())
+		
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		httpServer.Shutdown(shutdownCtx) // 3. SEPARATELY, explicitly tell the HTTP server to drain and stop
+	}();
 
 	var wg sync.WaitGroup = sync.WaitGroup{};
 	for i := 0; i < 3; i++ {

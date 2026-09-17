@@ -14,16 +14,20 @@
 #   6. Job metadata (job:<ID> hash tracks status/attempts across the job's lifecycle;
 #      confirm it goes pending -> running -> completed, and that attempts increments
 #      on a retry)
+#   7. HTTP server (POST /jobs enqueues or schedules a job depending on whether runAt
+#      is set, GET /jobs/{id} returns its metadata, GET /health checks Redis
+#      connectivity)
 #
-# Requires: redis-cli reachable, a built binary named `taskqueue` in the current dir
-#           (build it first: go build -o taskqueue .)
+# Requires: redis-cli and curl reachable, a built binary named `taskqueue` in the
+#           current dir (build it first: go build -o taskqueue .)
 #
-# Usage: ./test.sh [1|2|3|4|5|6|all]
+# Usage: ./test.sh [1|2|3|4|5|6|7|all]
 
 set -uo pipefail
 
 BINARY="./taskqueue"
 REDIS="redis-cli"
+HTTP_ADDR="http://localhost:8080"
 
 # ---- helpers ----------------------------------------------------------
 
@@ -87,6 +91,20 @@ section() {
     echo "############################################################"
     echo "# $1"
     echo "############################################################"
+}
+
+# wait_for_http <timeout_seconds>
+# Polls GET /health until it responds or the timeout elapses.
+wait_for_http() {
+    local timeout="$1"
+    for ((i = 0; i < timeout * 10; i++)); do
+        if curl -s -o /dev/null "$HTTP_ADDR/health"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "!! HTTP server did not become reachable within ${timeout}s"
+    return 1
 }
 
 # ---- test 1: normal processing ----------------------------------------
@@ -300,6 +318,55 @@ test_metadata() {
     $REDIS TTL job:MetaJob2
 }
 
+# ---- test 7: HTTP server ---------------------------------------------------
+
+test_http() {
+    section "TEST 7: HTTP server"
+    flush
+
+    echo "==> Starting program in background, waiting for /health"
+    "$BINARY" > /tmp/taskqueue_http_test.log 2>&1 &
+    PROG_PID=$!
+    wait_for_http 10 || { kill "$PROG_PID" 2>/dev/null; return 1; }
+
+    echo "==> GET /health:"
+    curl -s "$HTTP_ADDR/health"; echo
+
+    echo
+    echo "==> POST /jobs without runAt (regression check: this used to return 201"
+    echo "==> but never actually enqueue the job - see git history):"
+    RESP=$(curl -s -X POST "$HTTP_ADDR/jobs" -d '{"payload":"http job","priority":2}')
+    echo "$RESP"
+    JOB_ID=$(echo "$RESP" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+
+    sleep 1
+    echo "==> job:$JOB_ID exists in Redis (expect 1):"
+    $REDIS EXISTS "job:$JOB_ID"
+    echo "==> GET /jobs/$JOB_ID (expect it to be found, not 404):"
+    curl -s "$HTTP_ADDR/jobs/$JOB_ID"; echo
+
+    echo
+    echo "==> POST /jobs with runAt 1h out (regression check: this used to ALSO call"
+    echo "==> Enqueue, so a \"delayed\" job ran immediately instead of waiting):"
+    RUN_AT=$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ)
+    RESP=$(curl -s -X POST "$HTTP_ADDR/jobs" -d "{\"payload\":\"delayed http job\",\"priority\":1,\"runAt\":\"$RUN_AT\"}")
+    echo "$RESP"
+    SCHEDULED_ID=$(echo "$RESP" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+
+    sleep 1
+    echo "==> jobs-pending count (expect 0 - must NOT have run yet):"
+    $REDIS ZCARD jobs-pending
+    echo "==> GET /jobs/$SCHEDULED_ID (expect status \"scheduled\", not 404):"
+    curl -s "$HTTP_ADDR/jobs/$SCHEDULED_ID"; echo
+
+    echo
+    echo "==> GET /jobs/does-not-exist (expect 404):"
+    curl -s -w " [HTTP %{http_code}]\n" "$HTTP_ADDR/jobs/does-not-exist"
+
+    kill "$PROG_PID" 2>/dev/null
+    wait "$PROG_PID" 2>/dev/null
+}
+
 # ---- runner -------------------------------------------------------------
 
 if [[ ! -x "$BINARY" ]]; then
@@ -315,6 +382,7 @@ case "${1:-all}" in
     4) test_scheduled ;;
     5) test_priority ;;
     6) test_metadata ;;
+    7) test_http ;;
     all)
         test_normal
         test_reaper
@@ -322,9 +390,10 @@ case "${1:-all}" in
         test_scheduled
         test_priority
         test_metadata
+        test_http
         ;;
     *)
-        echo "Usage: $0 [1|2|3|4|5|6|all]"
+        echo "Usage: $0 [1|2|3|4|5|6|7|all]"
         exit 1
         ;;
 esac

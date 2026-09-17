@@ -61,15 +61,26 @@ shared across multiple worker processes.
   - **Job metadata** — a `job:<ID>` Redis hash (`status`, `attempts`, `priority`,
     `created_at`, `updated_at`) tracks each job's lifecycle independently of where
     it currently sits in the queue, so a caller can check on a job's status after
-    enqueueing it without needing to scan `jobs-pending`/`jobs-processing`. Written
-    at `Enqueue` (full seed), then updated by the worker when it starts running the
-    job, and by `Ack`/`Nack`/the reaper's reclaim path on every subsequent
+    enqueueing it without needing to scan `jobs-pending`/`jobs-processing`. Seeded
+    by `Enqueue` (status `pending`) or `scheduleJobs` (status `scheduled`) — whichever
+    puts the job in the system — then updated by the worker when it starts running
+    the job, and by `Ack`/`Nack`/the reaper's reclaim path on every subsequent
     transition. Once a job reaches a terminal state (`completed` or `dead`), its
-    hash gets a 24-hour TTL so it doesn't accumulate forever — a still-pending or
-    -running job's hash has no expiry. One caveat: if the worker's post-pickup
-    metadata write itself fails, the worker abandons that job in `jobs-processing`
-    rather than processing it anyway — recovery then depends on the stale-job
-    reaper reclaiming it later, same as a crashed worker
+    hash gets a 24-hour TTL so it doesn't accumulate forever — a still-pending,
+    -scheduled, or -running job's hash has no expiry. One caveat: if the worker's
+    post-pickup metadata write itself fails, the worker abandons that job in
+    `jobs-processing` rather than processing it anyway — recovery then depends on
+    the stale-job reaper reclaiming it later, same as a crashed worker
+- **HTTP API** (`http.go`), listening on `:8080` by default, for creating and
+  inspecting jobs without touching Redis directly:
+  - `POST /jobs` — body `{"payload": "...", "priority": 0-3, "runAt": "<RFC3339, optional>"}`.
+    Without `runAt`, the job is enqueued immediately (`Enqueue`); with `runAt`, it's
+    scheduled instead (`scheduleJobs`) — **never both**, so a delayed job actually
+    waits rather than also running right away. Returns `201` with `{"id", "status"}`
+  - `GET /jobs/{id}` — returns the job's `job:<ID>` metadata hash, or `404` if it
+    doesn't exist (including a scheduled job whose write hasn't landed yet, or a
+    terminal job whose 24h TTL has expired)
+  - `GET /health` — pings Redis; `200` if reachable, `503` otherwise
 - **Stale-job reaper** (`reaper.go`): a background goroutine (ticking every few
   seconds) that scans `jobs-processing-times` for jobs claimed longer than a
   configurable `staleAfter` window — catching jobs left behind by a worker that
@@ -85,8 +96,9 @@ shared across multiple worker processes.
   the queue is drained
 - **End-to-end test script** (`test.sh`): exercises the Redis queue against a real
   Redis instance — normal processing, crash + reaper recovery (`kill -9` mid-job),
-  dead-letter exhaustion, scheduled/delayed job release, priority ordering, and job
-  metadata tracking — inspecting queue state via `redis-cli` between runs
+  dead-letter exhaustion, scheduled/delayed job release, priority ordering, job
+  metadata tracking, and the HTTP API — inspecting queue state via `redis-cli`
+  (and the API via `curl`) between runs
 
 Using a channel instead of a shared slice means concurrent access to the in-memory
 queue is safe without a manual mutex — sends/receives are synchronized by the Go
@@ -112,6 +124,8 @@ This project is a work in progress. Planned next steps:
 - [x] Persistent per-job status metadata (`job:<ID>` hash), queryable independently
       of the job's current position in the queue, expiring 24h after the job reaches
       a terminal state
+- [x] HTTP API for creating and inspecting jobs (`POST /jobs`, `GET /jobs/{id}`,
+      `GET /health`) without needing direct Redis access
 - [ ] Distributed coordination across multiple worker processes using the Redis queue
 
 ## Requirements
@@ -125,9 +139,23 @@ This project is a work in progress. Planned next steps:
 go run .
 ```
 
-This starts the worker pool, Redis-backed queue, scheduler, and stale-job reaper, but
-does not enqueue any jobs on its own (the demo `NewJob`/`Enqueue` calls in `main.go`
-are currently commented out) — feed it jobs from another terminal, e.g.:
+This starts the worker pool, Redis-backed queue, scheduler, stale-job reaper, and the
+HTTP API on `:8080`, but does not enqueue any jobs on its own (the demo
+`NewJob`/`Enqueue` calls in `main.go` are currently commented out). The easiest way to
+feed it jobs is through the HTTP API:
+
+```bash
+# Enqueue immediately:
+curl -X POST localhost:8080/jobs -d '{"payload":"hi","priority":2}'
+
+# Schedule for later (RFC3339 runAt):
+curl -X POST localhost:8080/jobs -d '{"payload":"hi","priority":1,"runAt":"2026-09-15T18:00:00Z"}'
+
+# Check on a job:
+curl localhost:8080/jobs/<id>
+```
+
+Or push directly into Redis, bypassing the API and its metadata-seeding:
 
 ```bash
 # jobs-pending is a sorted set — score = (priority * 10_000_000_000) + unix timestamp.
@@ -152,5 +180,6 @@ behavior end-to-end, see `test.sh` below instead.
 ├── redis.go         # Redis-backed queue (priority sorted set + scheduling)
 ├── redis-worker.go  # Worker pool for the Redis queue
 ├── reaper.go        # Background stale-job reaper for the Redis queue
+├── http.go          # HTTP API (create/inspect jobs, health check)
 └── test.sh          # End-to-end test script against a real Redis instance
 ```
